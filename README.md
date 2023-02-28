@@ -34,6 +34,7 @@ python evaluate.py
 ```
 
 # Results
+![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/result_synthetic.png)
 ![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/result_cmos.png)
 
 # Contact
