@@ -9,6 +9,9 @@ pip install -r requirements.txt
 ```
 # Architecture
 
+![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/model_architecture.png)
+
+
 
 # Notebooks
 ```notebook_train.ipynb```
@@ -34,6 +37,7 @@ python evaluate.py
 ```
 
 # Results
+![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/result_synthetic.png)
 ![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/result_cmos.png)
 
 # Contact
