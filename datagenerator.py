@@ -6,6 +6,7 @@ from scipy.ndimage import gaussian_filter
 import cv2
 
 
+# Loads 3D image stacks (tif files) and normalize them
 def stack_generator_3D(GT_dr, low_dr, fr_start, fr_end):
     path_gt = GT_dr + '/*.tif'
     path_low = low_dr + '/*.tif'
@@ -40,6 +41,7 @@ def stack_generator_3D(GT_dr, low_dr, fr_start, fr_end):
     return crop_gt, crop_low
 
 
+# Generates training data by downscaling and projecting high-resolution 3D image stacks
 def data_generator(data_config):
     GT_dr = data_config['deconv_image_dr']
     low_dr = data_config['wf_image_dr']
@@ -56,10 +58,10 @@ def data_generator(data_config):
     shuffle = data_config['shuffle']
     add_noise = data_config['add_noise']
 
+    # Load the deconvolved and widefield 3D stacks
     gt, wf = stack_generator_3D(GT_dr, low_dr, fr_start, fr_end)
 
-    scale = int(patch_size*scale)
-
+    # Generate maximum/average intensity projection stacks as ground-truths
     if data_config['projection'] == "AIP":
         gt = np.mean(gt, axis=-2)
         wf = np.mean(wf, axis=-2)
@@ -68,104 +70,138 @@ def data_generator(data_config):
         wf = np.max(wf, axis=-2)
 
     print(gt.shape)
-    m = gt.shape[0]
-    img_size = gt.shape[2]
 
-    x = np.empty((m * n_patches * n_patches, patch_size, patch_size, 1), dtype=np.float64)
-    w = np.empty((m * n_patches * n_patches, patch_size, patch_size, 1), dtype=np.float64)
-    y = np.empty((m * n_patches * n_patches, scale, scale, 1), dtype=np.float64)
+    # Patch size after upscaling
+    scale = int(patch_size * scale)
 
-    rr = np.floor(np.linspace(0, img_size - scale, n_patches)).astype(np.int32)
-    cc = np.floor(np.linspace(0, img_size - scale, n_patches)).astype(np.int32)
+    # Noisy patches
+    x = np.empty((gt.shape[0] * n_patches * n_patches, patch_size, patch_size, 1), dtype=np.float64)
+    # High SNR patches
+    w = np.empty((gt.shape[0] * n_patches * n_patches, patch_size, patch_size, 1), dtype=np.float64)
+    # High SNR & high-resolution patches
+    y = np.empty((gt.shape[0] * n_patches * n_patches, scale, scale, 1), dtype=np.float64)
+
+    # Generate the coordinates of patches to be generated from projected images
+    rr = np.floor(np.linspace(0, gt.shape[2] - scale, n_patches)).astype(np.int32)
+    cc = np.floor(np.linspace(0, gt.shape[2] - scale, n_patches)).astype(np.int32)
 
     count = 0
-    for l in range(m):
+    for m in range(gt.shape[0]):
         for j in range(n_patches):
             for k in range(n_patches):
-                y[count, :, :, 0] = gt[l, rr[j]:rr[j] + scale, cc[k]:cc[k] + scale, n_channel]
+                # The kernel size of PSF to degrade the resolution of GT data (25% variation)
+                psf_filter_rand = psf_filter + psf_filter * (np.random.rand() - 0.5) / 4
+                y[count, :, :, 0] = gt[m, rr[j]:rr[j] + scale, cc[k]:cc[k] + scale, n_channel]
+
+                # Gaussian filtering to degrade the image resolution
                 wf_filtered = gaussian_filter(
-                    wf[l, rr[j]:rr[j] + patch_size, cc[k]:cc[k] + scale, n_channel], sigma=psf_filter)
-                x[count, :, :, 0] = cv2.resize(wf_filtered, dsize=(patch_size, patch_size),
-                                               interpolation=cv2.INTER_CUBIC)
+                    wf[m, rr[j]:rr[j] + scale, cc[k]:cc[k] + scale, n_channel], sigma=psf_filter_rand)
+
+                # Downscaling the filtered images
                 w[count, :, :, 0] = cv2.resize(wf_filtered, dsize=(patch_size, patch_size),
                                                interpolation=cv2.INTER_CUBIC)
+
+                # w[count, :, :, 0] = wf_filtered # Uncomment if the input and output pixel sizes are the same
+
+                x[count, :, :, 0] = w[count, :, :, 0]
                 count = count + 1
 
-    if add_noise:
-        for i in range(len(x)):
-            x[i] = np.random.poisson(x[i] / lp, size=x[i].shape)
-    x = x / (x.max(axis=(1, 2))).reshape((x.shape[0], 1, 1, 1))
+    # Adding poisson noise to low resolution images to generate noisy inputs
+    x = generate_noisy_image(x, lp, add_noise=add_noise)
 
-    if augment:
-        count = x.shape[0]
-        xx = np.zeros((4 * count, patch_size, patch_size, 1), dtype=np.float64)
-        ww = np.zeros((4 * count, patch_size, patch_size, 1), dtype=np.float64)
-        yy = np.zeros((4 * count, scale, scale, 1), dtype=np.float64)
+    # Data augmentation by flipping and rotating the images
+    xx, ww, yy = data_augmentation(x, w, y, augment=augment)
 
-        xx[0:count, :, :, :] = x
-        xx[count:2 * count, :, :, :] = np.flip(x, axis=1)
-        xx[2 * count:3 * count, :, :, :] = np.flip(x, axis=2)
-        xx[3 * count:4 * count, :, :, :] = np.flip(x, axis=(1, 2))
+    # Select patches that their normalized average intensity is higher than a threshold
+    xxx, www, yyy = patch_selector(xx, ww, yy, threshold)
 
-        ww[0:count, :, :, :] = w
-        ww[count:2 * count, :, :, :] = np.flip(w, axis=1)
-        ww[2 * count:3 * count, :, :, :] = np.flip(w, axis=2)
-        ww[3 * count:4 * count, :, :, :] = np.flip(w, axis=(1, 2))
+    # Shuffle the image stacks
+    xxs, wws, yys = data_shuffler(xxx, www, yyy, shuffle=shuffle)
 
-        yy[0:count, :, :, :] = y
-        yy[count:2 * count, :, :, :] = np.flip(y, axis=1)
-        yy[2 * count:3 * count, :, :, :] = np.flip(y, axis=2)
-        yy[3 * count:4 * count, :, :, :] = np.flip(y, axis=(1, 2))
-    else:
-        xx = x
-        ww = w
-        yy = y
-
-    norm_x = np.linalg.norm(yy, axis=(1, 2))
-    norm_x = norm_x / norm_x.max()
-    ind_norm = np.where(norm_x > threshold)[0]
-
-    xxx = np.empty((len(ind_norm), xx.shape[1], xx.shape[2], xx.shape[3]))
-    www = np.empty((len(ind_norm), ww.shape[1], ww.shape[2], ww.shape[3]))
-    yyy = np.empty((len(ind_norm), yy.shape[1], yy.shape[2], yy.shape[3]))
-
-    for i in range(len(ind_norm)):
-        xxx[i] = xx[ind_norm[i]]
-        www[i] = ww[ind_norm[i]]
-        yyy[i] = yy[ind_norm[i]]
-
-    aa = np.linspace(0, len(xxx) - 1, len(xxx))
-    random.shuffle(aa)
-    aa = aa.astype(int)
-
-    xxs = np.empty(xxx.shape, dtype=np.float64)
-    wws = np.empty(www.shape, dtype=np.float64)
-    yys = np.empty(yyy.shape, dtype=np.float64)
-
-    if shuffle:
-        for i in range(len(xxx)):
-            xxs[i] = xxx[aa[i]]
-            wws[i] = www[aa[i]]
-            yys[i] = yyy[aa[i]]
-    else:
-        xxs = xxx
-        wws = www
-        yys = yyy
-
-    xxs[xxs < 0] = 0
-    for i in range(len(xxs)):
-        for j in range(n_channel):
-            xxs[i, :, :, j] = xxs[i, :, :, j] / xxs[i, :, :, j].max()
-            wws[i, :, :, j] = wws[i, :, :, j] / wws[i, :, :, j].max()
-            if yys[i, :, :, j].max() > 0:
-                yys[i, :, :, j] = yys[i, :, :, j] / yys[i, :, :, j].max()
-
-    x_train = xxs
-    w_train = wws
-    y_train = yys
+    # Normalize the image stacks
+    x_train = xxs / (xxs.max(axis=(1, 2))).reshape((xxs.shape[0], 1, 1, 1))
+    w_train = wws / (wws.max(axis=(1, 2))).reshape((wws.shape[0], 1, 1, 1))
+    y_train = yys / (yys.max(axis=(1, 2))).reshape((yys.shape[0], 1, 1, 1))
 
     print('Dataset shape:', x_train.shape)
     return x_train, w_train, y_train
+
+
+def generate_noisy_image(input, lp, add_noise=False):
+    x = np.zeros(input.shape)
+    if add_noise:
+        for i in range(len(input)):
+            lambp = lp + lp * (np.random.rand() - 0.5)
+            x[i] = np.random.poisson(input[i] * lambp, size=input[i].shape)
+    else:
+        x = input
+    x = x / (x.max(axis=(1, 2))).reshape((x.shape[0], 1, 1, 1))
+    return x
+
+
+def data_augmentation(input, output1, output2, augment=False):
+    if augment:
+        count = input.shape[0]
+        x = np.zeros(((4 * count,) + input.shape[1:]), dtype=np.float64)
+        w = np.zeros(((4 * count,) + input.shape[1:]), dtype=np.float64)
+        y = np.zeros(((4 * count,) + output2.shape[1:]), dtype=np.float64)
+
+        x[0:count, :, :, :] = input
+        x[count:2 * count, :, :, :] = np.flip(input, axis=1)
+        x[2 * count:3 * count, :, :, :] = np.flip(input, axis=2)
+        x[3 * count:4 * count, :, :, :] = np.flip(input, axis=(1, 2))
+
+        w[0:count, :, :, :] = output1
+        w[count:2 * count, :, :, :] = np.flip(output1, axis=1)
+        w[2 * count:3 * count, :, :, :] = np.flip(output1, axis=2)
+        w[3 * count:4 * count, :, :, :] = np.flip(output1, axis=(1, 2))
+
+        y[0:count, :, :, :] = output2
+        y[count:2 * count, :, :, :] = np.flip(output2, axis=1)
+        y[2 * count:3 * count, :, :, :] = np.flip(output2, axis=2)
+        y[3 * count:4 * count, :, :, :] = np.flip(output2, axis=(1, 2))
+    else:
+        x = input
+        w = output1
+        y = output2
+
+    return x, w, y
+
+
+def patch_selector(input, output1, output2, threshold):
+    norm = np.linalg.norm(output2, axis=(1, 2))
+    norm = norm / norm.max()
+    ind_norm = np.where(norm > threshold)[0]
+
+    x = np.empty((len(ind_norm),) + input.shape[1:])
+    w = np.empty((len(ind_norm),) + output1.shape[1:])
+    y = np.empty((len(ind_norm),) + output2.shape[1:])
+
+    for i in range(len(ind_norm)):
+        x[i] = x[ind_norm[i]]
+        w[i] = w[ind_norm[i]]
+        y[i] = y[ind_norm[i]]
+    return x, w, y
+
+
+def data_shuffler(input, output1, output2, shuffle=False):
+    if shuffle:
+        ind_shuffled = np.linspace(0, len(input) - 1, len(input))
+        random.shuffle(ind_shuffled)
+        ind_shuffled = ind_shuffled.astype(int)
+
+        x = np.empty(input.shape, dtype=np.float64)
+        w = np.empty(output1.shape, dtype=np.float64)
+        y = np.empty(output2.shape, dtype=np.float64)
+        for i in range(len(input)):
+            x[i] = input[ind_shuffled[i]]
+            w[i] = output1[ind_shuffled[i]]
+            y[i] = output2[ind_shuffled[i]]
+    else:
+        x = input
+        w = output1
+        y = output2
+    return x, w, y
 
 
 def data_generator_test(data_config):
@@ -190,6 +226,7 @@ def data_generator_test(data_config):
     if add_noise:
         for i in range(len(low)):
             low[i] = np.random.poisson(low[i] / lp, size=low[i].shape)
+    low = low / low.max(axis=(-1, -2)).reshape(low.shape[0:2] + (1, 1))
 
     x = np.empty((m * n_patches * n_patches, patch_size, patch_size, 1), dtype=np.float64)
 
