@@ -8,7 +8,7 @@ The networks are built in Tensorflow 2.7.0 framework.
 pip install -r requirements.txt
 ```
 # Architecture
-![plot]()
+![plot](https://github.com/vebrahimi1990/image_resolution_enhancement/blob/master/image_files/model_architecture.png)
 
 # Notebooks
 ```notebook_train.ipynb```
